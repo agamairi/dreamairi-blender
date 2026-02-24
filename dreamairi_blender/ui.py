@@ -1,6 +1,7 @@
 """User interface panels and operators."""
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass
 import textwrap
@@ -8,10 +9,9 @@ from typing import Optional
 
 import bpy
 
+from .core.agent import AgentState
 from .core.generator import (
     append_log,
-    execute_plan,
-    format_plan,
     run_generation,
 )
 from .llm import prompts
@@ -32,11 +32,24 @@ from .util.http import get_json
 from .util.logging import LogBuffer
 
 
+from .tools.registry import ToolExecutionContext, ToolResult, agent_registry
+
+@dataclass
+class ToolRequest:
+    op_name: str
+    payload: dict
+    event: threading.Event
+    exec_context: Optional[ToolExecutionContext] = None
+    result: Optional[ToolResult] = None
+
 @dataclass
 class ActiveJob:
     thread: threading.Thread
     token: CancellationToken
     mode: str
+    log_buffer: LogBuffer
+    agent_state: AgentState
+    pending_tool: Optional[ToolRequest] = None
     done: bool = False
     error: Optional[str] = None
     result: Optional[object] = None
@@ -154,6 +167,8 @@ class DREAMAIRI_OT_TestConnection(bpy.types.Operator):
         if requires_api_key(prefs.provider) and not api_key:
             self.report({'ERROR'}, "API key is required")
             return {'CANCELLED'}
+        try:
+            _test_connection(prefs, api_key)
         except Exception as exc: 
             self.report({'ERROR'}, f"Connection failed: {exc}")
             return {'CANCELLED'}
@@ -354,6 +369,10 @@ class _BaseGenerateOperator(bpy.types.Operator):
             self.report({'ERROR'}, "Prompt is empty")
             return {'CANCELLED'}
 
+        settings.plan_text = ""
+        settings.tools_text = ""
+        settings.results_text = ""
+
         api_key = _get_api_key(prefs, settings)
         if requires_api_key(prefs.provider) and not api_key:
             self.report({'ERROR'}, "API key is required")
@@ -367,7 +386,21 @@ class _BaseGenerateOperator(bpy.types.Operator):
         token = CancellationToken()
         IN_MEMORY_SECRETS.set_api_key(api_key)
 
-        def worker(p_snap, s_snap, c_snap) -> None:
+        log_buffer = LogBuffer()
+        agent_state = AgentState()
+
+        def worker(p_snap, s_snap, c_snap, l_buf, a_state) -> None:
+            def sync_executor(op_name: str, payload: dict, exec_context: Optional[ToolExecutionContext] = None) -> object:
+                req = ToolRequest(
+                    op_name=op_name,
+                    payload=payload,
+                    event=threading.Event(),
+                    exec_context=exec_context,
+                )
+                _ACTIVE_JOB.pending_tool = req
+                req.event.wait()
+                return req.result
+
             try:
                 result = run_generation(
                     prefs=p_snap,
@@ -375,6 +408,9 @@ class _BaseGenerateOperator(bpy.types.Operator):
                     scene_context=c_snap,
                     session_key=api_key,
                     cancel_token=token,
+                    log_buffer=l_buf,
+                    agent_state=a_state,
+                    tool_executor=sync_executor,
                 )
                 _ACTIVE_JOB.result = result
             except Exception as exc: 
@@ -382,11 +418,17 @@ class _BaseGenerateOperator(bpy.types.Operator):
             finally:
                 _ACTIVE_JOB.done = True
 
-        _ACTIVE_JOB = ActiveJob(thread=threading.Thread(
-            target=worker, 
-            args=(prefs_snap, settings_snap, scene_ctx_snap), 
-            daemon=True
-        ), token=token, mode=self.mode)
+        _ACTIVE_JOB = ActiveJob(
+            thread=threading.Thread(
+                target=worker, 
+                args=(prefs_snap, settings_snap, scene_ctx_snap, log_buffer, agent_state), 
+                daemon=True
+            ),
+            token=token,
+            mode=self.mode,
+            log_buffer=log_buffer,
+            agent_state=agent_state
+        )
         _ACTIVE_JOB.thread.start()
         self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
         context.window_manager.modal_handler_add(self)
@@ -394,45 +436,54 @@ class _BaseGenerateOperator(bpy.types.Operator):
 
     def modal(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
         global _ACTIVE_JOB
-        if event.type != 'TIMER' or not _ACTIVE_JOB:
-            return {'RUNNING_MODAL'}
-        if not _ACTIVE_JOB.done:
-            return {'RUNNING_MODAL'}
+        if not _ACTIVE_JOB:
+            return {'PASS_THROUGH'}
+            
         settings = context.scene.dreamairi_settings
         prefs = get_preferences(context)
         secrets = [prefs.api_key, settings.session_api_key] if prefs else []
-        if _ACTIVE_JOB.error:
-            _set_log(settings, f"Error: {_ACTIVE_JOB.error}", secrets)
-            self._finish(context)
-            return {'CANCELLED'}
-        result = _ACTIVE_JOB.result
-        if result is None:
-            _set_log(settings, "No response received", secrets)
-            self._finish(context)
-            return {'CANCELLED'}
+            
+        if event.type == 'TIMER':
+            if _ACTIVE_JOB.log_buffer.text:
+                _set_log(settings, _ACTIVE_JOB.log_buffer.text, secrets)
+                _ACTIVE_JOB.log_buffer.text = ""
+                
+            settings.plan_text = _ACTIVE_JOB.agent_state.plan_text
+            settings.tools_text = _ACTIVE_JOB.agent_state.tools_text
+            settings.results_text = _ACTIVE_JOB.agent_state.results_text
 
-        _set_log(settings, f"request_id: {result.request_id}", secrets)
-        _set_log(settings, f"provider: {prefs.provider if prefs else 'unknown'}", secrets)
-        _set_log(settings, f"model: {prefs.model_name if prefs else 'unknown'}", secrets)
-        _set_log(settings, f"summary: {result.plan.summary}", secrets)
-        _set_log(settings, f"plan_json:\n{format_plan(result.plan)}", secrets)
-        if prefs and prefs.debug_logging:
-            _set_log(settings, f"raw_response:\n{result.raw_text}", secrets)
-        if _ACTIVE_JOB.mode == "apply":
-            try:
-                execute_plan(
-                    result.plan,
-                    target_poly_budget=settings.triangle_budget,
-                    style_preset=settings.style_preset,
-                )
-                _set_log(settings, "Execution completed", secrets)
-            except Exception as exc: 
-                _set_log(settings, f"Execution failed: {exc}", secrets)
+            if _ACTIVE_JOB.pending_tool:
+                req = _ACTIVE_JOB.pending_tool
+                req.result = agent_registry.execute(req.op_name, req.payload, req.exec_context)
+                _ACTIVE_JOB.pending_tool = None
+                req.event.set()
+                return {'PASS_THROUGH'}
+
+            if not _ACTIVE_JOB.done:
+                return {'PASS_THROUGH'}
+
+            if _ACTIVE_JOB.error:
+                _set_log(settings, f"Error: {_ACTIVE_JOB.error}", secrets)
+                self._finish(context)
+                return {'CANCELLED'}
+                
+            result = _ACTIVE_JOB.result
+            if result is None:
+                _set_log(settings, "No response received", secrets)
                 self._finish(context)
                 return {'CANCELLED'}
 
-        self._finish(context)
-        return {'FINISHED'}
+            status_text = "Agent Finished Successfully" if result.success else "Agent Finished with Errors"
+            _set_log(settings, f"{status_text}", secrets)
+            _set_log(settings, f"Summary: {result.summary}", secrets)
+            _set_log(settings, f"Operations executed: {result.operations}", secrets)
+            if result.error_type:
+                _set_log(settings, f"Error type: {result.error_type}", secrets)
+
+            self._finish(context)
+            return {'FINISHED'}
+
+        return {'PASS_THROUGH'}
 
     def _finish(self, context: bpy.types.Context) -> None:
         global _ACTIVE_JOB
@@ -462,86 +513,119 @@ class DREAMAIRI_PT_Panel(bpy.types.Panel):
         prefs = get_preferences(context)
         settings = context.scene.dreamairi_settings
 
-        layout.label(text="Provider")
-        if prefs:
-            layout.prop(prefs, "provider")
-            row = layout.row(align=True)
-            row.prop(prefs, "model_enum", text="Model")
-            row.operator("dreamairi.refresh_models", text="", icon='FILE_REFRESH')
-            layout.prop(prefs, "model_name")
-            row = layout.row(align=True)
-            row.prop(prefs, "base_url")
-            row.prop(prefs, "lock_url", text="", icon='LOCKED' if prefs.lock_url else 'UNLOCKED')
-            layout.operator("dreamairi.reset_base_url", text="Reset URL")
-            if context.window_manager.dreamairi_model_fetch_time:
-                layout.label(text=f"Last model fetch: {context.window_manager.dreamairi_model_fetch_time}")
-            if context.window_manager.dreamairi_model_fetch_info:
-                layout.label(text=context.window_manager.dreamairi_model_fetch_info)
-            if context.window_manager.dreamairi_model_fetch_error:
-                layout.label(text=f"Model fetch error: {context.window_manager.dreamairi_model_fetch_error}")
-            layout.prop(prefs, "remember_key")
+        box = layout.box()
+        row = box.row(align=True)
+        row.prop(
+            settings,
+            "ui_show_settings",
+            icon="TRIA_DOWN" if settings.ui_show_settings else "TRIA_RIGHT",
+            emboss=False,
+            text="Settings",
+        )
+        if settings.ui_show_settings and prefs:
+            box.prop(prefs, "provider")
+            model_row = box.row(align=True)
+            model_row.prop(prefs, "model_enum", text="Model")
+            model_row.operator("dreamairi.refresh_models", text="", icon="FILE_REFRESH")
+            box.prop(prefs, "model_name", text="Model Override")
+            api_row = box.row(align=True)
             if prefs.remember_key:
-                layout.prop(prefs, "api_key")
+                api_row.prop(prefs, "api_key", text="API Key")
             else:
-                layout.prop(settings, "session_api_key", text="API Key")
-            layout.operator("dreamairi.test_connection", icon='CHECKMARK')
-        else:
-            layout.label(text="Preferences not found")
+                api_row.prop(settings, "session_api_key", text="API Key")
+            api_row.prop(prefs, "remember_key", text="Remember")
+            box.prop(settings, "max_ops")
+            box.prop(settings, "max_tool_calls_per_step")
+            box.prop(settings, "max_noop_steps")
+            box.prop(settings, "model_timeout_seconds")
+            retry_row = box.row(align=True)
+            retry_row.prop(settings, "model_max_retries")
+            retry_row.prop(settings, "retry_backoff_seconds")
+            box.prop(settings, "style_preset")
+            box.prop(settings, "triangle_budget")
+            box.prop(prefs, "append_custom_prompt")
+            prompt_row = box.row(align=True)
+            prompt_row.prop(prefs, "custom_system_prompt_text_name", text="System Prompt Text")
+            prompt_row.operator("dreamairi.open_system_prompt_text", text="", icon="FILE_TEXT")
 
-        layout.separator()
-        layout.label(text="Prompting")
-        if prefs:
-            layout.label(text="Custom System Prompt Text")
-            row = layout.row(align=True)
-            row.prop(prefs, "custom_system_prompt_text_name", text="")
-            row.operator("dreamairi.open_system_prompt_text", text="Open Custom System Prompt", icon='FILE_TEXT')
-            preview = _get_custom_prompt_preview(prefs)
-            if preview:
-                layout.label(text=f"Preview: {preview}")
-            else:
-                layout.label(text="Preview: (empty)")
-            layout.operator("dreamairi.show_default_prompt", text="View Default System Prompt")
-            layout.operator("dreamairi.show_effective_prompt", text="Show Effective System Prompt")
-            layout.prop(prefs, "append_custom_prompt")
-            row = layout.row(align=True)
-            row.operator("dreamairi.reset_custom_prompt", text="Reset Custom System Prompt")
-            row.operator("dreamairi.reset_default_prompt", text="Reset to Default")
-
-        layout.prop(settings, "style_preset")
-        layout.prop(settings, "triangle_budget")
-        layout.label(text="Prompt Input Text")
+        layout.label(text="Chat Prompt")
         layout.template_ID(settings, "prompt_text_block", new="text.new", open="text.open")
         if not settings.prompt_text_block:
-            layout.prop(settings, "prompt_text", text="Prompt Input")
-        row = layout.row(align=True)
-        row.prop(settings, "example_prompt", text="")
-        row.operator("dreamairi.use_example", text="Use Example")
+            prompt_col = layout.column()
+            prompt_col.scale_y = 1.5
+            prompt_col.prop(settings, "prompt_text", text="")
 
-        layout.separator()
-        layout.label(text="Generation")
-        layout.prop(settings, "strict_mode")
-        
         global _ACTIVE_JOB
-        is_busy = _ACTIVE_JOB and not _ACTIVE_JOB.done
-        
-        row = layout.row(align=True)
-        if is_busy:
-            row.operator("dreamairi.generate_apply", text="Generating...", icon='TIME', depress=True)
-            row.enabled = False
-        else:
-            row.operator("dreamairi.generate_apply", icon='PLAY')
-            
-        if is_busy:
-            layout.label(text="Status: AI is working...", icon='INFO')
-            layout.operator("dreamairi.stop", icon='CANCEL')
-        elif _ACTIVE_JOB and _ACTIVE_JOB.done and _ACTIVE_JOB.error:
-            layout.label(text="Last Error: (See Logs)", icon='ERROR')
+        is_busy = bool(_ACTIVE_JOB and not _ACTIVE_JOB.done)
 
-        layout.separator()
-        layout.label(text="Logs")
-        layout.prop(settings, "show_logs")
-        if settings.show_logs:
-            layout.prop(settings, "log_text", text="")
+        row = layout.row(align=True)
+        row.scale_y = 1.6
+        if is_busy:
+            state = _ACTIVE_JOB.agent_state
+            row.operator("dreamairi.stop", text=f"Stop ({state.status})", icon='CANCEL', depress=True)
+        else:
+            row.operator("dreamairi.generate_apply", text="Run", icon='PLAY')
+        row.prop(settings, "fast_mode", text="Fast mode", toggle=True)
+        row.prop(settings, "ui_verbose", text="Verbose", toggle=True)
+
+        status_box = layout.box()
+        if _ACTIVE_JOB:
+            state = _ACTIVE_JOB.agent_state
+            status_box.label(text=f"Status: {state.status}")
+            status_box.label(text=f"Step: {state.step}/{state.max_steps if state.max_steps else settings.max_ops}")
+            status_box.label(text=f"Last tool: {state.last_tool or '-'}")
+            if state.last_error:
+                status_box.label(text=f"Last error: {state.last_error}", icon="ERROR")
+        else:
+            status_box.label(text="Status: Idle")
+            status_box.label(text=f"Plan required: {'No (Fast mode)' if settings.fast_mode else 'Yes'}")
+
+        toggle_row = layout.row(align=True)
+        toggle_row.prop(settings, "ui_show_plan", text="Plan", toggle=True)
+        toggle_row.prop(settings, "ui_show_tools", text="Tool calls", toggle=True)
+        toggle_row.prop(settings, "ui_show_results", text="Tool results", toggle=True)
+        toggle_row.prop(settings, "show_logs", text="Logs", toggle=True)
+
+        def _render_lines(box_layout, text_block: str, limit: int) -> None:
+            lines = [line for line in text_block.splitlines() if line.strip()]
+            for line in lines[-limit:]:
+                if settings.ui_verbose:
+                    box_layout.label(text=line[:180])
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    box_layout.label(text=line[:180])
+                    continue
+                if "tool" in payload and "success" in payload:
+                    status = "ok" if payload.get("success") else "error"
+                    box_layout.label(text=f"{payload.get('tool')} -> {status}: {payload.get('message', '')[:90]}")
+                elif "tool" in payload and "args" in payload:
+                    box_layout.label(text=f"{payload.get('tool')}({', '.join(payload.get('args', {}).keys())})")
+                else:
+                    box_layout.label(text=line[:180])
+
+        if settings.ui_show_plan and settings.plan_text:
+            box_plan = layout.box()
+            box_plan.label(text="Plan")
+            for line in [line for line in settings.plan_text.splitlines() if line.strip()][-20:]:
+                box_plan.label(text=line[:180])
+
+        if settings.ui_show_tools and settings.tools_text:
+            box_tools = layout.box()
+            box_tools.label(text="Tool Calls")
+            _render_lines(box_tools, settings.tools_text, 20)
+
+        if settings.ui_show_results and settings.results_text:
+            box_results = layout.box()
+            box_results.label(text="Tool Results")
+            _render_lines(box_results, settings.results_text, 20)
+
+        if settings.show_logs and settings.log_text:
+            box_logs = layout.box()
+            box_logs.label(text="Logs")
+            for line in [line for line in settings.log_text.splitlines() if line.strip()][-30:]:
+                box_logs.label(text=line[:180])
 
 
 classes = (

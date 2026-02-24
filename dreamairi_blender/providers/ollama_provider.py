@@ -19,10 +19,9 @@ class OllamaProvider:
             "stream": False,
             "messages": [
                 {"role": "system", "content": request.system_prompt},
-                {"role": "user", "content": request.user_prompt},
-            ],
+            ] + [{"role": msg.role, "content": msg.content} for msg in request.messages],
         }
-        _, data = post_json(url, payload, headers={}, timeout=60.0, cancel_token=cancel_token)
+        _, data = post_json(url, payload, headers={}, timeout=request.timeout_seconds, cancel_token=cancel_token)
         return _extract_content(data)
 
 

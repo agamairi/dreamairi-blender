@@ -16,8 +16,9 @@ def main() -> None:
         sys.path.insert(0, str(repo_root))
 
     import dreamairi_blender
-    from dreamairi_blender.core.generator import execute_plan, run_generation
+    from dreamairi_blender.core.generator import run_generation
     from dreamairi_blender.preferences import snapshot_generation_settings, snapshot_preferences
+    from dreamairi_blender.tools.context import build_scene_context
     from dreamairi_blender.util.cancel import CancellationToken
 
     dreamairi_blender.register()
@@ -37,10 +38,11 @@ def main() -> None:
     result = run_generation(
         prefs=snapshot_preferences(bpy.context),
         settings=snapshot_generation_settings(settings),
+        scene_context=build_scene_context(snapshot_generation_settings(settings)),
         session_key="",
         cancel_token=CancellationToken(),
     )
-    execute_plan(result.plan, target_poly_budget=settings.triangle_budget)
+    assert result.summary, "Expected non-empty summary"
 
     dreamairi_blender.unregister()
 

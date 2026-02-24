@@ -8,10 +8,17 @@ from ..util.cancel import CancellationToken
 
 
 @dataclass
+class ProviderMessage:
+    role: str
+    content: str
+
+
+@dataclass
 class ProviderRequest:
     model: str
     system_prompt: str
-    user_prompt: str
+    messages: list[ProviderMessage]
+    timeout_seconds: float = 60.0
 
 
 class Provider(Protocol):

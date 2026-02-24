@@ -19,9 +19,11 @@ def build_scene_context(settings: object) -> Dict[str, object]:
     selected = context.selected_objects or []
     collections = [col.name for col in bpy.data.collections]
     active = context.active_object.name if context.active_object else None
+    working_directory = bpy.path.abspath("//") or ""
     style = get_style_preset(settings.style_preset)
     return {
         "blender_version": bpy.app.version_string,
+        "working_directory": working_directory,
         "units": {
             "system": context.scene.unit_settings.system,
             "scale_length": context.scene.unit_settings.scale_length,

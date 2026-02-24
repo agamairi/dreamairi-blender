@@ -347,10 +347,45 @@ class DreamAiriSettings(bpy.types.PropertyGroup):
     )
 
     max_ops: IntProperty(
-        name="Max Ops",
-        default=80,
+        name="Max Steps",
+        default=40,
         min=1,
         max=200,
+    )
+    fast_mode: BoolProperty(
+        name="Fast Mode",
+        description="Allow the model to skip the required PLAN step",
+        default=False,
+    )
+    max_tool_calls_per_step: IntProperty(
+        name="Max Tool Calls / Step",
+        default=4,
+        min=1,
+        max=12,
+    )
+    max_noop_steps: IntProperty(
+        name="Max No-Progress Steps",
+        default=4,
+        min=1,
+        max=20,
+    )
+    model_timeout_seconds: IntProperty(
+        name="Model Timeout (s)",
+        default=60,
+        min=10,
+        max=300,
+    )
+    model_max_retries: IntProperty(
+        name="Model Retries",
+        default=2,
+        min=0,
+        max=5,
+    )
+    retry_backoff_seconds: FloatProperty(
+        name="Retry Backoff (s)",
+        default=1.0,
+        min=0.1,
+        max=10.0,
     )
     max_primitives: IntProperty(
         name="Max Primitives",
@@ -362,6 +397,16 @@ class DreamAiriSettings(bpy.types.PropertyGroup):
         name="Paranoid Mode",
         default=True,
     )
+
+    ui_show_settings: BoolProperty(name="Settings", default=False)
+    ui_show_plan: BoolProperty(name="Plan", default=False)
+    ui_show_tools: BoolProperty(name="Tool Calls", default=False)
+    ui_show_results: BoolProperty(name="Tool Results", default=False)
+    ui_verbose: BoolProperty(name="Verbose JSON", default=False)
+
+    plan_text: StringProperty(name="Plan", default="")
+    tools_text: StringProperty(name="Tools", default="")
+    results_text: StringProperty(name="Results", default="")
 
     bevel_default: FloatProperty(
         name="Bevel Default",
@@ -389,6 +434,12 @@ class GenerationSettingsSnapshot:
     triangle_budget: int
     prompt_text: str
     max_ops: int
+    fast_mode: bool
+    max_tool_calls_per_step: int
+    max_noop_steps: int
+    model_timeout_seconds: int
+    model_max_retries: int
+    retry_backoff_seconds: float
     max_primitives: int
     strict_mode: bool
 
@@ -422,6 +473,12 @@ def snapshot_generation_settings(settings: DreamAiriSettings) -> GenerationSetti
         triangle_budget=settings.triangle_budget,
         prompt_text=resolve_prompt_text(settings),
         max_ops=settings.max_ops,
+        fast_mode=settings.fast_mode,
+        max_tool_calls_per_step=settings.max_tool_calls_per_step,
+        max_noop_steps=settings.max_noop_steps,
+        model_timeout_seconds=settings.model_timeout_seconds,
+        model_max_retries=settings.model_max_retries,
+        retry_backoff_seconds=settings.retry_backoff_seconds,
         max_primitives=settings.max_primitives,
         strict_mode=settings.strict_mode,
     )

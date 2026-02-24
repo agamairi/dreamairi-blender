@@ -21,10 +21,14 @@ class GeminiProvider:
         payload = {
             "systemInstruction": {"parts": [{"text": request.system_prompt}]},
             "contents": [
-                {"role": "user", "parts": [{"text": request.user_prompt}]},
+                {
+                    "role": "user" if msg.role == "user" else "model",
+                    "parts": [{"text": msg.content}]
+                }
+                for msg in request.messages
             ],
         }
-        _, data = post_json(url, payload, headers={}, timeout=60.0, cancel_token=cancel_token)
+        _, data = post_json(url, payload, headers={}, timeout=request.timeout_seconds, cancel_token=cancel_token)
         return _extract_content(data)
 
 

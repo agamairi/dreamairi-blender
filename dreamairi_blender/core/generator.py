@@ -1,33 +1,18 @@
-"""Generation pipeline for DreamAiri-blender."""
+"""Generation pipeline entrypoint for DreamAiri agent runs."""
 from __future__ import annotations
 
-import json
-import os
-import uuid
-from dataclasses import dataclass
-from typing import Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from ..llm import parser
-from ..llm.contract import ModelPlan
+from .agent import AgentController, AgentResult, AgentState
 from ..llm.prompts import build_prompt
 from ..preferences import GenerationSettingsSnapshot, PreferencesSnapshot
-from ..providers.base import ProviderRequest
 from ..providers.factory import build_provider
 from ..security.sanitizer import redact
 from ..security.secrets import IN_MEMORY_SECRETS, SecretsStore
-from ..tools.context import build_scene_context
-from ..tools.executor import ToolExecutor
-from ..util.style_presets import get_style_preset
-from ..tools.validator import ValidationSettings, validate_plan
+from ..tools.registry import ToolExecutionContext, ensure_builtin_tools_registered
 from ..util.cancel import CancellationToken
 from ..util.logging import LogBuffer
-
-
-@dataclass
-class GenerationResult:
-    request_id: str
-    plan: ModelPlan
-    raw_text: str
 
 
 def resolve_secrets(prefs: PreferencesSnapshot, session_key: str) -> SecretsStore:
@@ -38,72 +23,57 @@ def resolve_secrets(prefs: PreferencesSnapshot, session_key: str) -> SecretsStor
     return IN_MEMORY_SECRETS
 
 
+def _default_workspace_root(scene_context: Dict[str, object]) -> str:
+    working_directory = scene_context.get("working_directory")
+    if isinstance(working_directory, str) and working_directory.strip():
+        return str(Path(working_directory).resolve())
+    return ""
+
+
 def run_generation(
     prefs: PreferencesSnapshot,
     settings: GenerationSettingsSnapshot,
     scene_context: Dict[str, object],
     session_key: str,
     cancel_token: CancellationToken,
-) -> GenerationResult:
-    request_id = str(uuid.uuid4())
+    log_buffer: Optional[LogBuffer] = None,
+    agent_state: Optional[AgentState] = None,
+    tool_executor: Optional[Any] = None,
+) -> AgentResult:
+    ensure_builtin_tools_registered()
+    secrets = resolve_secrets(prefs, session_key)
+    provider = build_provider(prefs.provider, prefs.base_url, prefs.model_name, secrets)
 
-    if os.getenv("DREAMAIRI_MOCK_RESPONSE"):
-        raw_text = os.environ["DREAMAIRI_MOCK_RESPONSE"]
-    else:
-        secrets = resolve_secrets(prefs, session_key)
-        provider = build_provider(prefs.provider, prefs.base_url, prefs.model_name, secrets)
-        bundle = build_prompt(
-            scene_context=scene_context,
-            user_request=settings.prompt_text,
-            custom_system_prompt=prefs.custom_system_prompt,
-            append_custom=prefs.append_custom_prompt,
-        )
-        request = ProviderRequest(
-            model=prefs.model_name,
-            system_prompt=bundle.system_prompt,
-            user_prompt=bundle.user_prompt,
-        )
-        raw_text = provider.send_chat(request, cancel_token)
-
-    plan = parser.parse_and_validate(raw_text)
-    validation = ValidationSettings(
-        max_ops=settings.max_ops,
-        max_primitives=settings.max_primitives,
-        strict_mode=settings.strict_mode,
-        poly_budget=settings.triangle_budget,
+    prompt_bundle = build_prompt(
+        scene_context=scene_context,
+        user_request=settings.prompt_text,
+        custom_system_prompt=prefs.custom_system_prompt,
+        append_custom=prefs.append_custom_prompt,
+        fast_mode=settings.fast_mode,
     )
-    validate_plan(plan, validation)
-    return GenerationResult(request_id=request_id, plan=plan, raw_text=raw_text)
 
+    tool_context = ToolExecutionContext(workspace_root=_default_workspace_root(scene_context))
+    agent = AgentController(
+        provider=provider,
+        model=prefs.model_name,
+        system_prompt=prompt_bundle.system_prompt,
+        cancel_token=cancel_token,
+        log_buffer=log_buffer,
+        tool_executor=tool_executor,
+        tool_context=tool_context,
+        model_timeout_seconds=float(settings.model_timeout_seconds),
+        max_model_retries=int(settings.model_max_retries),
+        retry_backoff_seconds=float(settings.retry_backoff_seconds),
+        require_plan_first=not settings.fast_mode,
+        max_tool_calls_per_turn=int(settings.max_tool_calls_per_step),
+        max_noop_steps=int(settings.max_noop_steps),
+    )
+    if agent_state is not None:
+        agent.state = agent_state
 
-def execute_plan(
-    plan: ModelPlan,
-    target_poly_budget: int | None = None,
-    style_preset: str | None = None,
-) -> None:
-    actions: List[Dict[str, object]] = [
-        {"op": op.op, "payload": op.payload} for op in plan.ops
-    ]
-    executor = ToolExecutor()
-    executor.execute(actions)
-    if style_preset:
-        preset = get_style_preset(style_preset)
-        executor.apply_shading("FLAT" if preset.flat_shading else "SMOOTH")
-    if target_poly_budget is not None:
-        executor.apply_decimate(target_poly_budget)
-
-
-def format_plan(plan: ModelPlan) -> str:
-    payload = {
-        "version": plan.version,
-        "summary": plan.summary,
-        "style": {"poly_budget": plan.style.poly_budget, "notes": plan.style.notes},
-        "ops": [
-            {"op": op.op, **op.payload} for op in plan.ops
-        ],
-    }
-    return json.dumps(payload, indent=2)
+    return agent.run(prompt_bundle.user_prompt, max_iterations=int(settings.max_ops))
 
 
 def append_log(buffer: LogBuffer, message: str, secrets: List[str]) -> None:
     buffer.append(redact(message, secrets))
+

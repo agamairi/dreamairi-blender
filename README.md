@@ -1,45 +1,139 @@
-# DreamAiri-blender 🌌
+# DreamAiri-Blender
 
-**DreamAiri** is a lightweight, secure Blender add-on that brings the power of Large Language Models (LLMs) directly into your 3D workflow. Generate low-poly models, prototype scenes, and explore ideas using natural language.
+DreamAiri is a Blender add-on that runs a strict agent loop:
 
----
+1. `PLAN`
+2. `TOOL_CALL` (whitelisted tools only)
+3. `VERIFY` (tool results returned to model)
+4. iterate until `FINAL`
 
-## ✨ Features
+No arbitrary Python can be requested from the model. Scene mutations happen only through the tool registry.
 
-- **Multi-Provider Support**: Connect to Ollama (local), OpenRouter, OpenAI, or Google Gemini.
-- **Security-First Architecture**: Uses a strict **Whitelist Tool Executor**. No arbitrary Python execution, ever.
-- **Low-Poly Focused**: Built-in constraints for triangle budgets and efficient modifier stacks.
-- **Developer Friendly**: Clean JSON-based operation contract and robust logging with automatic secret redaction.
-- **Integrated Workflow**: Edit your prompts in Blender's Text Editor and see status updates in real-time.
+## Architecture
 
-## 🚀 Quick Start
+Core modules:
 
-1. **Install**: Download the repository, zip the `dreamairi_blender` folder, and install via `Edit > Preferences > Add-ons`.
-2. **Setup**: Open the N-panel (press `N` in the 3D View) and select the **DreamAiri-blender** tab.
-3. **Configure**: Select your provider and enter your API key.
-4. **Generate**: Type a prompt like *"Create a low-poly bowling pin with a red ring"* and hit **Generate**.
+- `/Users/agamairi/Downloads/dreamairi-blender-main/dreamairi_blender/core/agent.py`
+  - Multi-turn agent controller
+  - Enforces `PLAN` / `TOOL_CALL` / `FINAL` envelope contract
+  - Guardrails: max steps, retries/backoff, max tool calls per turn, no-progress stop, repeated-call stop
+- `/Users/agamairi/Downloads/dreamairi-blender-main/dreamairi_blender/llm/prompts.py`
+  - Strict system prompt with response schema and tool registry catalog
+  - Fast mode policy toggle (plan-first required or optional)
+- `/Users/agamairi/Downloads/dreamairi-blender-main/dreamairi_blender/tools/registry.py`
+  - Typed tool metadata
+  - JSON-schema-like argument validator
+  - Permission checks
+  - Structured `ToolResult` with error taxonomy
+- `/Users/agamairi/Downloads/dreamairi-blender-main/dreamairi_blender/tools/implementations.py`
+  - Starter toolset (scene, animation, workspace file ops, diagnostics)
 
-## 🛡️ Security
+Error taxonomy:
 
-DreamAiri is built to be safe for the community. We use a strictly whitelisted execution model to ensure that LLMs only perform authorized Blender operations. For more details, see [SECURITY.md](SECURITY.md).
+- `validation_error`
+- `tool_error`
+- `blender_error`
+- `model_error`
 
-## 🛠️ Testing
+## Tooling Model
 
-Keep the codebase stable with our integrated test suite.
+The model can only call registered tools.
 
-**Unit Tests**:
-```bash
-python -m unittest discover -s tests
+Starter toolset includes:
+
+- Scene ops: `create_primitive`, `delete_objects`, `select_objects`, `transform_object`, `assign_material`, `import_asset`, `export_asset`, `export_glb`
+- Rig/animation ops: `create_action`, `set_active_action`, `pose_bone_transform`, `insert_keyframe`, `duplicate_action`, `mirror_action`, `bake_action`, `set_current_frame`
+- Workspace file ops: `list_project_files`, `read_project_file`, `write_project_file`
+- Diagnostics: `get_selection`, `list_actions`, `list_armatures`, `get_current_frame`, `get_diagnostics`
+
+All tool calls return structured JSON-like dictionaries (`ToolResult.to_dict()`).
+
+## Security Model
+
+- Deny-by-default tool invocation via registry.
+- Strict argument validation against each tool schema.
+- Permission-gated execution (scene/anim/file/diagnostics scopes).
+- Workspace-scoped file access only:
+  - relative or absolute paths must resolve inside workspace root
+  - small file limits for read/write
+- No `exec`, no `eval`, no arbitrary Python from model output.
+
+## UI
+
+Panel is focused on:
+
+- Chat prompt input
+- Run / Stop
+- Status (`Thinking`, `Running tool`, `Done`, `Error`)
+- Step progress (`step/max`, last tool, last error)
+- Collapsible sections:
+  - Plan
+  - Tool calls
+  - Tool results
+  - Logs
+- `Fast mode` toggle (if off, agent must output plan first)
+- `Verbose` toggle (raw JSON visibility)
+
+## Add a Tool (Developer)
+
+1. Implement handler in `/Users/agamairi/Downloads/dreamairi-blender-main/dreamairi_blender/tools/implementations.py`.
+2. Define metadata:
+   - `name`
+   - `description`
+   - `args_schema`
+   - `permissions`
+3. Register it in `_tool_specs()` so `register_default_tools()` includes it.
+4. Run test harness.
+
+Minimal example:
+
+```python
+from dreamairi_blender.tools.registry import ToolMetadata, ToolResult
+
+def my_tool(args, _ctx=None):
+    return ToolResult(True, "ok", {"echo": args["text"]})
+
+ToolMetadata(
+    name="my_tool",
+    description="Example tool",
+    args_schema={
+        "type": "object",
+        "required": ["text"],
+        "properties": {"text": {"type": "string"}},
+        "additionalProperties": False,
+    },
+    permissions=["diagnostics:read"],
+)
 ```
 
-**Blender Integration (Headless)**:
+## Testing
+
+Lightweight (no Blender required):
+
 ```bash
-blender --background --factory-startup --python tests/blender_integration.py
+python3 -m unittest \
+  tests.test_registry \
+  tests.test_contract \
+  tests.test_tool_validation_harness \
+  tests.test_validator
 ```
 
-## 🤝 Contributing
+Blender smoke workflow:
 
-Contributions are welcome! Whether it's adding new whitelisted tools, improving prompts, or fixing bugs, feel free to open a PR.
+```bash
+blender --background --factory-startup --python /Users/agamairi/Downloads/dreamairi-blender-main/tests/smoke_test.py
+```
 
----
-*Created with ❤️ for the Blender Community.*
+Smoke script verifies:
+
+1. import model
+2. create rig action
+3. keyframe pose
+4. export GLB
+
+## Example Prompts
+
+- `Create tennis forehand animation for my selected character armature and export GLB.`
+- `Duplicate the current backhand action, mirror it to opposite side, then assign it to the rig.`
+- `Import character.glb, create an idle action with subtle arm swing, and export character_animated.glb.`
+
