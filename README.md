@@ -45,6 +45,7 @@ Starter toolset includes:
 - Rig/animation ops: `create_action`, `set_active_action`, `pose_bone_transform`, `insert_keyframe`, `duplicate_action`, `mirror_action`, `bake_action`, `set_current_frame`
 - Workspace file ops: `list_project_files`, `read_project_file`, `write_project_file`
 - Diagnostics: `get_selection`, `list_actions`, `list_armatures`, `get_current_frame`, `get_diagnostics`
+- Inspection/render ops: `render_viewport_snapshot`, `render_turntable_preview`, `get_object_dimensions`, `get_object_profile_samples`, `get_scene_summary`, `measure_object_symmetry`, `get_mesh_stats`
 
 All tool calls return structured JSON-like dictionaries (`ToolResult.to_dict()`).
 
@@ -52,7 +53,7 @@ All tool calls return structured JSON-like dictionaries (`ToolResult.to_dict()`)
 
 - Deny-by-default tool invocation via registry.
 - Strict argument validation against each tool schema.
-- Permission-gated execution (scene/anim/file/diagnostics scopes).
+- Permission-gated execution (scene/anim/file/diagnostics/render scopes).
 - Workspace-scoped file access only:
   - relative or absolute paths must resolve inside workspace root
   - small file limits for read/write
@@ -136,4 +137,3 @@ Smoke script verifies:
 - `Create tennis forehand animation for my selected character armature and export GLB.`
 - `Duplicate the current backhand action, mirror it to opposite side, then assign it to the rig.`
 - `Import character.glb, create an idle action with subtle arm swing, and export character_animated.glb.`
-

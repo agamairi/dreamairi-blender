@@ -42,6 +42,15 @@ def run_smoke_test() -> None:
     )
     _assert_success("create_primitive", create_res)
 
+    dimensions_res = agent_registry.execute("get_object_dimensions", {"object_name": "SmokeSource", "space": "world"})
+    _assert_success("get_object_dimensions", dimensions_res)
+
+    mesh_stats_res = agent_registry.execute("get_mesh_stats", {"object_name": "SmokeSource"})
+    _assert_success("get_mesh_stats", mesh_stats_res)
+
+    scene_summary_res = agent_registry.execute("get_scene_summary", {})
+    _assert_success("get_scene_summary", scene_summary_res)
+
     export_source = agent_registry.execute("export_glb", {"filename": "smoke_source.glb", "target": "SmokeSource"})
     _assert_success("export_glb(source)", export_source)
     source_path = export_source.data["path"]
@@ -107,4 +116,3 @@ def run_smoke_test() -> None:
 
 if __name__ == "__main__":
     run_smoke_test()
-

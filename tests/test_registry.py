@@ -5,6 +5,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dreamairi_blender.core.errors import ERROR_VALIDATION
+from dreamairi_blender.tools import implementations
 from dreamairi_blender.tools.registry import (
     AgentToolRegistry,
     ToolExecutionContext,
@@ -77,7 +78,39 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(denied.error_type, ERROR_VALIDATION)
         self.assertIn("permission denied", denied.message.lower())
 
+    def test_default_specs_include_inspection_tools(self) -> None:
+        registry = AgentToolRegistry()
+        implementations.register_default_tools(registry)
+        names = {tool.name for tool in registry.list_tools()}
+        expected = {
+            "render_viewport_snapshot",
+            "render_turntable_preview",
+            "get_object_dimensions",
+            "get_object_profile_samples",
+            "get_scene_summary",
+            "measure_object_symmetry",
+            "get_mesh_stats",
+        }
+        self.assertTrue(expected.issubset(names))
+
+        render_meta = registry.get_tool("render_viewport_snapshot")
+        self.assertIsNotNone(render_meta)
+        assert render_meta is not None
+        self.assertIn("render:read", render_meta.permissions)
+        self.assertIn("file:write", render_meta.permissions)
+
+    def test_schema_rejects_invalid_inspection_args(self) -> None:
+        registry = AgentToolRegistry()
+        implementations.register_default_tools(registry)
+
+        invalid_view = registry.execute("render_viewport_snapshot", {"view": "rear"})
+        self.assertFalse(invalid_view.success)
+        self.assertEqual(invalid_view.error_type, ERROR_VALIDATION)
+
+        invalid_axis = registry.execute("measure_object_symmetry", {"object_name": "Cube", "axis": "w"})
+        self.assertFalse(invalid_axis.success)
+        self.assertEqual(invalid_axis.error_type, ERROR_VALIDATION)
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -18,6 +18,7 @@ DEFAULT_PERMISSIONS: Set[str] = {
     "file:read",
     "file:write",
     "diagnostics:read",
+    "render:read",
 }
 
 
